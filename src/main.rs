@@ -28,24 +28,40 @@ fn build_api_url(continuation: &str, api_key: &str) -> String {
     )
 }
 
-fn fetch_api_key_and_continuation(
-    client: &Client,
-    video_id: &str,
-) -> Result<(String, String), reqwest::Error> {
+fn fetch_raw_html(client: &Client, video_id: &str) -> Result<String, reqwest::Error> {
     let res = client
         .get(&build_video_url(video_id))
         .header(header::USER_AGENT, USER_AGENT)
         .send()?
         .text()?;
-    let re_api_key = Regex::new(r#""INNERTUBE_API_KEY":"(.*?)""#).unwrap();
-    let api_key = re_api_key.captures(res.as_str()).unwrap()[1].to_owned();
-    let re_continuation = Regex::new(r#""continuation":"([a-zA-Z0-9]+)""#).unwrap();
-    let continuation = re_continuation.captures(res.as_str()).unwrap()[1].to_owned();
-
-    Ok((api_key, continuation))
+    Ok(res)
 }
 
-fn extract_continuation(data: &JsonObject) -> Option<String> {
+fn extract_api_key_from_html(raw_html: &str) -> Option<String> {
+    let re = Regex::new(r#""INNERTUBE_API_KEY":"(.*?)""#).unwrap();
+    match re.captures(raw_html) {
+        Some(caps) => Some(caps[1].to_owned()),
+        None => None,
+    }
+}
+
+fn extract_continuation_from_html(raw_html: &str) -> Option<String> {
+    let re = Regex::new(r#""continuation":"([a-zA-Z0-9]+)""#).unwrap();
+    match re.captures(raw_html) {
+        Some(caps) => Some(caps[1].to_owned()),
+        None => None,
+    }
+}
+
+fn extract_duration_from_html(raw_html: &str) -> Option<i32> {
+    let re = Regex::new(r#"\\"approxDurationMs\\":\\"(\d+)\\""#).unwrap();
+    match re.captures(raw_html) {
+        Some(caps) => Some(caps[1].to_owned().parse().unwrap()),
+        None => None,
+    }
+}
+
+fn extract_continuation_from_json(data: &JsonObject) -> Option<String> {
     Some(
         data.get("continuationContents")?
             .get("liveChatContinuation")?
@@ -60,7 +76,7 @@ fn extract_continuation(data: &JsonObject) -> Option<String> {
     )
 }
 
-fn extract_actions(data: &JsonObject) -> Option<JsonArray> {
+fn extract_actions_from_json(data: &JsonObject) -> Option<JsonArray> {
     Some(
         data.get("continuationContents")?
             .get("liveChatContinuation")?
@@ -70,7 +86,7 @@ fn extract_actions(data: &JsonObject) -> Option<JsonArray> {
     )
 }
 
-fn extract_timestamp(data: &serde_json::Value) -> Option<&str> {
+fn extract_timestamp_from_json(data: &serde_json::Value) -> Option<&str> {
     Some(
         data.get("replayChatItemAction")?
             .get("videoOffsetTimeMsec")?
@@ -89,8 +105,8 @@ fn fetch_live_chats_once(
         .body(POST_BODY)
         .send()?;
     let data: JsonObject = serde_json::from_reader(res).unwrap();
-    let continuation = extract_continuation(&data);
-    let actions = extract_actions(&data);
+    let continuation = extract_continuation_from_json(&data);
+    let actions = extract_actions_from_json(&data);
     Ok(if let (Some(c), Some(a)) = (continuation, actions) {
         Some((c, a))
     } else {
@@ -100,17 +116,21 @@ fn fetch_live_chats_once(
 
 fn fetch_all_live_chats(video_id: &str) -> JsonArray {
     let client = Client::builder().cookie_store(true).build().unwrap();
-    let (api_key, mut continuation) = fetch_api_key_and_continuation(&client, video_id).unwrap();
-    let mut live_chats = Vec::new();
+    let raw_html = fetch_raw_html(&client, video_id).unwrap();
+    let api_key = extract_api_key_from_html(raw_html.as_str()).unwrap();
+    let mut continuation = extract_continuation_from_html(raw_html.as_str()).unwrap();
+    let duration = extract_duration_from_html(raw_html.as_str()).unwrap() as f64;
+
+    let mut live_chats = Vec::with_capacity((duration / 200.0) as usize);
     loop {
         let api_response = fetch_live_chats_once(&client, &continuation, &api_key).unwrap();
         if let Some((c, mut a)) = api_response {
             continuation = c;
-            if let Some(timestamp) = extract_timestamp(a.last().unwrap()) {
+            if let Some(timestamp) = extract_timestamp_from_json(a.last().unwrap()) {
                 print!(
-                    "\rlast chat time: {:.2} min, fetched chats: {}",
-                    (timestamp.parse::<f64>().unwrap() / 60_000.0),
-                    a.len()
+                    "\rProgress: {:.2}%; Total live chats: {}",
+                    timestamp.parse::<f64>().unwrap() / duration * 100.0,
+                    live_chats.len() + a.len()
                 );
                 std::io::stdout().flush().unwrap();
             }
@@ -122,6 +142,7 @@ fn fetch_all_live_chats(video_id: &str) -> JsonArray {
         }
     }
 
+    live_chats.shrink_to_fit();
     live_chats
 }
 
