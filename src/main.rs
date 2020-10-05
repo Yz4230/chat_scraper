@@ -5,8 +5,7 @@ extern crate serde_derive;
 extern crate serde_json;
 
 use regex::Regex;
-use reqwest::blocking::Client;
-use reqwest::header;
+use reqwest::{header, Client};
 use std::io::Write;
 use std::{fs, io};
 
@@ -27,12 +26,17 @@ fn build_api_url(continuation: &str, api_key: &str) -> String {
     )
 }
 
-fn fetch_raw_html(client: &Client, video_id: &str) -> reqwest::Result<String> {
+async fn fetch_raw_html(
+    client: &Client,
+    video_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let res = client
         .get(&build_video_url(video_id))
         .header(header::USER_AGENT, USER_AGENT)
-        .send()?
-        .text()?;
+        .send()
+        .await?
+        .text()
+        .await?;
     Ok(res)
 }
 
@@ -88,17 +92,18 @@ fn extract_timestamp_from_json(data: &Json) -> Option<&str> {
     )
 }
 
-fn fetch_live_chats_once(
+async fn fetch_live_chats_once(
     client: &Client,
     continuation: &str,
     api_key: &str,
-) -> reqwest::Result<Option<(String, Json)>> {
+) -> Result<Option<(String, Json)>, Box<dyn std::error::Error>> {
     let res = client
         .post(&build_api_url(continuation, api_key))
         .header(header::CONTENT_TYPE, "application/json")
         .body(POST_BODY)
-        .send()?;
-    let data: Json = res.json()?;
+        .send()
+        .await?;
+    let data: Json = res.json().await?;
     let continuation = extract_continuation_from_json(&data);
     let actions = extract_actions_from_json(&data);
     Ok(if let (Some(c), Some(a)) = (continuation, actions) {
@@ -108,16 +113,16 @@ fn fetch_live_chats_once(
     })
 }
 
-fn fetch_all_live_chats(video_id: &str) -> Vec<Json> {
+async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::error::Error>> {
     let client = Client::builder().cookie_store(true).build().unwrap();
-    let raw_html = fetch_raw_html(&client, video_id).unwrap();
+    let raw_html = fetch_raw_html(&client, video_id).await.unwrap();
     let api_key = extract_api_key_from_html(raw_html.as_str()).unwrap();
     let mut continuation = extract_continuation_from_html(raw_html.as_str()).unwrap();
     let duration = extract_duration_from_html(raw_html.as_str()).unwrap() as f64;
 
     let mut live_chats = Vec::<Json>::with_capacity((duration / 200.0) as usize);
     loop {
-        match fetch_live_chats_once(&client, &continuation, &api_key).unwrap() {
+        match fetch_live_chats_once(&client, &continuation, &api_key).await? {
             Some((c, mut a)) => {
                 continuation = c;
                 let actions = a.as_array_mut().unwrap();
@@ -139,10 +144,11 @@ fn fetch_all_live_chats(video_id: &str) -> Vec<Json> {
     }
 
     live_chats.shrink_to_fit();
-    live_chats
+    Ok(live_chats)
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     print!("Live streaming id: ");
     io::stdout().flush().unwrap();
     let mut video_id = String::new();
@@ -150,7 +156,7 @@ fn main() {
     video_id = video_id.trim_end().to_owned();
     println!("Set target: {}", video_id);
 
-    let live_chats = fetch_all_live_chats(video_id.as_str());
+    let live_chats = fetch_all_live_chats(video_id.as_str()).await.unwrap();
     println!(
         "Fetched all live chats successfully!: {} live chats",
         live_chats.len()
