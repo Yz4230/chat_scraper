@@ -6,8 +6,10 @@ extern crate serde_json;
 
 use regex::Regex;
 use reqwest::{header, Client};
-use std::io::Write;
+use std::io::{BufWriter, Write};
+use std::sync::Arc;
 use std::{fs, io};
+use tokio::sync::Mutex;
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.125 Safari/537.36,gzip(gfe) ";
 const POST_BODY: &str = r#"{"hidden": false, "context": {"client": {"hl": "en", "gl": "JP", "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.125 Safari/537.36,gzip(gfe)", "clientName": "WEB", "clientVersion": "2.20200822.00.00", "osName": "X11", "browserName": "Chrome", "browserVersion": "84.0.4147.125"}}}"#;
@@ -120,21 +122,28 @@ async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::
     let mut continuation = extract_continuation_from_html(raw_html.as_str()).unwrap();
     let duration = extract_duration_from_html(raw_html.as_str()).unwrap() as f64;
 
-    let mut live_chats = Vec::<Json>::with_capacity((duration / 200.0) as usize);
+    let estimated_chats = (duration / 200.0) as usize;
+    let live_chats = Arc::new(Mutex::new(Vec::<Json>::with_capacity(estimated_chats)));
+    let mut handlers = vec![];
     loop {
         match fetch_live_chats_once(&client, &continuation, &api_key).await? {
             Some((c, mut a)) => {
                 continuation = c;
-                let actions = a.as_array_mut().unwrap();
-                if let Some(timestamp) = extract_timestamp_from_json(actions.last().unwrap()) {
-                    print!(
-                        "\rProgress: {:.2}%; Total live chats: {}",
-                        timestamp.parse::<f64>().unwrap() / duration * 100.0,
-                        live_chats.len() + actions.len()
-                    );
-                    io::stdout().flush().unwrap();
-                }
-                live_chats.append(actions);
+                let live_chats_arc = Arc::clone(&live_chats);
+
+                handlers.push(tokio::spawn(async move {
+                    let mut lock = live_chats_arc.lock().await;
+                    let actions = a.as_array_mut().unwrap();
+                    if let Some(timestamp) = extract_timestamp_from_json(actions.last().unwrap()) {
+                        print!(
+                            "\rProgress: {:.2}%; Total live chats: {}",
+                            timestamp.parse::<f64>().unwrap() / duration * 100.0,
+                            (*lock).len() + actions.len()
+                        );
+                        io::stdout().flush().unwrap();
+                    }
+                    (*lock).append(actions);
+                }));
             }
             None => {
                 println!();
@@ -143,8 +152,11 @@ async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::
         }
     }
 
-    live_chats.shrink_to_fit();
-    Ok(live_chats)
+    for handler in handlers {
+        handler.await;
+    }
+    let result = &*live_chats.lock().await;
+    Ok(result.to_owned())
 }
 
 #[tokio::main]
@@ -169,7 +181,7 @@ async fn main() {
         .truncate(true)
         .open(&dist)
         .unwrap();
-    serde_json::to_writer_pretty(&file, &live_chats).unwrap();
+    serde_json::to_writer_pretty(BufWriter::new(file), &live_chats).unwrap();
 
     println!("Live chats was saved at: {}", dist);
 }
