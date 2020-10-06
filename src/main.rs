@@ -9,6 +9,7 @@ use reqwest::{header, Client};
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::{fs, io};
+use tokio::runtime;
 use tokio::sync::Mutex;
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.125 Safari/537.36,gzip(gfe) ";
@@ -116,6 +117,7 @@ async fn fetch_live_chats_once(
 }
 
 async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::error::Error>> {
+    let threaded_rt = runtime::Builder::new().threaded_scheduler().build()?;
     let client = Client::builder().cookie_store(true).build().unwrap();
     let raw_html = fetch_raw_html(&client, video_id).await.unwrap();
     let api_key = extract_api_key_from_html(raw_html.as_str()).unwrap();
@@ -131,7 +133,7 @@ async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::
                 continuation = c;
                 let live_chats_arc = Arc::clone(&live_chats);
 
-                handlers.push(tokio::spawn(async move {
+                handlers.push(threaded_rt.spawn(async move {
                     let mut lock = live_chats_arc.lock().await;
                     let actions = a.as_array_mut().unwrap();
                     if let Some(timestamp) = extract_timestamp_from_json(actions.last().unwrap()) {
@@ -153,8 +155,9 @@ async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::
     }
 
     for handler in handlers {
-        handler.await;
+        handler.await.unwrap();
     }
+    threaded_rt.shutdown_background();
     let result = &*live_chats.lock().await;
     Ok(result.to_owned())
 }
