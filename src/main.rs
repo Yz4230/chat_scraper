@@ -131,10 +131,10 @@ async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::
         match fetch_live_chats_once(&client, &continuation, &api_key).await? {
             Some((c, mut a)) => {
                 continuation = c;
-                let live_chats_arc = Arc::clone(&live_chats);
+                let live_chats_clone = Arc::clone(&live_chats);
 
                 handlers.push(threaded_rt.spawn(async move {
-                    let mut lock = live_chats_arc.lock().await;
+                    let mut lock = live_chats_clone.lock().await;
                     let actions = a.as_array_mut().unwrap();
                     if let Some(timestamp) = extract_timestamp_from_json(actions.last().unwrap()) {
                         print!(
@@ -158,8 +158,8 @@ async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::
         handler.await.unwrap();
     }
     threaded_rt.shutdown_background();
-    let result = &*live_chats.lock().await;
-    Ok(result.to_owned())
+    let result = Arc::try_unwrap(live_chats).unwrap().into_inner();
+    Ok(result)
 }
 
 #[tokio::main]
