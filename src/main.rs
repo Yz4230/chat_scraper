@@ -1,23 +1,19 @@
+extern crate chat_scraper;
 extern crate regex;
 extern crate reqwest;
 extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 
-use regex::Regex;
+use chat_scraper::video_details::VideoDetails;
 use reqwest::blocking::Client;
 use reqwest::header;
 use std::io::{BufWriter, Write};
 use std::{fs, io, sync};
 
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.125 Safari/537.36,gzip(gfe) ";
 const POST_BODY: &str = r#"{"hidden": false, "context": {"client": {"hl": "en", "gl": "JP", "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.125 Safari/537.36,gzip(gfe)", "clientName": "WEB", "clientVersion": "2.20200822.00.00", "osName": "X11", "browserName": "Chrome", "browserVersion": "84.0.4147.125"}}}"#;
 
 type Json = serde_json::Value;
-
-fn build_video_url(video_id: &str) -> String {
-    "https://www.youtube.com/watch?v=".to_owned() + video_id
-}
 
 fn build_api_url(continuation: &str, api_key: &str) -> String {
     format!(
@@ -25,39 +21,6 @@ fn build_api_url(continuation: &str, api_key: &str) -> String {
         continuation = continuation,
         api_key = api_key
     )
-}
-
-fn fetch_raw_html(client: &Client, video_id: &str) -> reqwest::Result<String> {
-    let res = client
-        .get(&build_video_url(video_id))
-        .header(header::USER_AGENT, USER_AGENT)
-        .send()?
-        .text()?;
-    Ok(res)
-}
-
-fn extract_api_key_from_html(raw_html: &str) -> Option<String> {
-    let re = Regex::new(r#""INNERTUBE_API_KEY":"(.*?)""#).unwrap();
-    match re.captures(raw_html) {
-        Some(caps) => Some(caps[1].to_owned()),
-        None => None,
-    }
-}
-
-fn extract_continuation_from_html(raw_html: &str) -> Option<String> {
-    let re = Regex::new(r#""continuation":"([a-zA-Z0-9]+)""#).unwrap();
-    match re.captures(raw_html) {
-        Some(caps) => Some(caps[1].to_owned()),
-        None => None,
-    }
-}
-
-fn extract_duration_from_html(raw_html: &str) -> Option<i32> {
-    let re = Regex::new(r#"\\"approxDurationMs\\":\\"(\d+)\\""#).unwrap();
-    match re.captures(raw_html) {
-        Some(caps) => Some(caps[1].to_owned().parse().unwrap()),
-        None => None,
-    }
 }
 
 fn extract_continuation_from_json(data: &Json) -> Option<&str> {
@@ -109,13 +72,11 @@ fn fetch_live_chats_once(
 }
 
 fn fetch_all_live_chats(video_id: &str) -> reqwest::Result<Vec<Json>> {
-    let client = Client::builder().cookie_store(true).build().unwrap();
-    let raw_html = fetch_raw_html(&client, video_id)?;
-    let api_key = extract_api_key_from_html(raw_html.as_str()).unwrap();
-    let mut continuation = extract_continuation_from_html(raw_html.as_str()).unwrap();
-    let duration = extract_duration_from_html(raw_html.as_str()).unwrap();
-    let mut result = vec![];
+    let video_details = VideoDetails::get(video_id).unwrap();
+    let (api_key, mut continuation) = (video_details.api_key, video_details.continuation);
 
+    let client = Client::new();
+    let mut result = vec![];
     let (send, recv) = sync::mpsc::channel();
     let handle = std::thread::spawn(move || loop {
         match fetch_live_chats_once(&client, &continuation, &api_key).unwrap() {
@@ -135,7 +96,7 @@ fn fetch_all_live_chats(video_id: &str) -> reqwest::Result<Vec<Json>> {
         if let Some(timestamp) = extract_timestamp_from_json(actions.last().unwrap()) {
             print!(
                 "\rProgress: {:.2}%; Total live chats: {}",
-                timestamp.parse::<f64>().unwrap() / (duration as f64) * 100.0,
+                timestamp.parse::<f64>().unwrap() / (video_details.duration as f64) * 100.0,
                 result.len() + actions.len()
             );
             io::stdout().flush().unwrap();
