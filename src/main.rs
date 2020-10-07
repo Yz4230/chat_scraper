@@ -5,12 +5,10 @@ extern crate serde_derive;
 extern crate serde_json;
 
 use regex::Regex;
-use reqwest::{header, Client};
+use reqwest::blocking::Client;
+use reqwest::header;
 use std::io::{BufWriter, Write};
-use std::sync::Arc;
-use std::{fs, io};
-use tokio::runtime;
-use tokio::sync::Mutex;
+use std::{fs, io, sync};
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.125 Safari/537.36,gzip(gfe) ";
 const POST_BODY: &str = r#"{"hidden": false, "context": {"client": {"hl": "en", "gl": "JP", "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.125 Safari/537.36,gzip(gfe)", "clientName": "WEB", "clientVersion": "2.20200822.00.00", "osName": "X11", "browserName": "Chrome", "browserVersion": "84.0.4147.125"}}}"#;
@@ -29,17 +27,12 @@ fn build_api_url(continuation: &str, api_key: &str) -> String {
     )
 }
 
-async fn fetch_raw_html(
-    client: &Client,
-    video_id: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn fetch_raw_html(client: &Client, video_id: &str) -> reqwest::Result<String> {
     let res = client
         .get(&build_video_url(video_id))
         .header(header::USER_AGENT, USER_AGENT)
-        .send()
-        .await?
-        .text()
-        .await?;
+        .send()?
+        .text()?;
     Ok(res)
 }
 
@@ -95,18 +88,17 @@ fn extract_timestamp_from_json(data: &Json) -> Option<&str> {
     )
 }
 
-async fn fetch_live_chats_once(
+fn fetch_live_chats_once(
     client: &Client,
     continuation: &str,
     api_key: &str,
 ) -> Result<Option<(String, Json)>, Box<dyn std::error::Error>> {
-    let res = client
+    let data: Json = client
         .post(&build_api_url(continuation, api_key))
         .header(header::CONTENT_TYPE, "application/json")
         .body(POST_BODY)
-        .send()
-        .await?;
-    let data: Json = res.json().await?;
+        .send()?
+        .json()?;
     let continuation = extract_continuation_from_json(&data);
     let actions = extract_actions_from_json(&data);
     Ok(if let (Some(c), Some(a)) = (continuation, actions) {
@@ -116,54 +108,46 @@ async fn fetch_live_chats_once(
     })
 }
 
-async fn fetch_all_live_chats(video_id: &str) -> Result<Vec<Json>, Box<dyn std::error::Error>> {
-    let threaded_rt = runtime::Builder::new().threaded_scheduler().build()?;
+fn fetch_all_live_chats(video_id: &str) -> reqwest::Result<Vec<Json>> {
     let client = Client::builder().cookie_store(true).build().unwrap();
-    let raw_html = fetch_raw_html(&client, video_id).await.unwrap();
+    let raw_html = fetch_raw_html(&client, video_id)?;
     let api_key = extract_api_key_from_html(raw_html.as_str()).unwrap();
     let mut continuation = extract_continuation_from_html(raw_html.as_str()).unwrap();
-    let duration = extract_duration_from_html(raw_html.as_str()).unwrap() as f64;
+    let duration = extract_duration_from_html(raw_html.as_str()).unwrap();
+    let mut result = vec![];
 
-    let estimated_chats = (duration / 200.0) as usize;
-    let live_chats = Arc::new(Mutex::new(Vec::<Json>::with_capacity(estimated_chats)));
-    let mut handlers = vec![];
-    loop {
-        match fetch_live_chats_once(&client, &continuation, &api_key).await? {
+    let (send, recv) = sync::mpsc::channel();
+    let handle = std::thread::spawn(move || loop {
+        match fetch_live_chats_once(&client, &continuation, &api_key).unwrap() {
             Some((c, mut a)) => {
                 continuation = c;
-                let live_chats_clone = Arc::clone(&live_chats);
-
-                handlers.push(threaded_rt.spawn(async move {
-                    let mut lock = live_chats_clone.lock().await;
-                    let actions = a.as_array_mut().unwrap();
-                    if let Some(timestamp) = extract_timestamp_from_json(actions.last().unwrap()) {
-                        print!(
-                            "\rProgress: {:.2}%; Total live chats: {}",
-                            timestamp.parse::<f64>().unwrap() / duration * 100.0,
-                            (*lock).len() + actions.len()
-                        );
-                        io::stdout().flush().unwrap();
-                    }
-                    (*lock).append(actions);
-                }));
+                let actions = a.as_array_mut().unwrap().clone();
+                send.send(actions).unwrap();
             }
             None => {
                 println!();
                 break;
             }
         }
-    }
+    });
 
-    for handler in handlers {
-        handler.await.unwrap();
+    for mut actions in recv {
+        if let Some(timestamp) = extract_timestamp_from_json(actions.last().unwrap()) {
+            print!(
+                "\rProgress: {:.2}%; Total live chats: {}",
+                timestamp.parse::<f64>().unwrap() / (duration as f64) * 100.0,
+                result.len() + actions.len()
+            );
+            io::stdout().flush().unwrap();
+        }
+        result.append(&mut actions)
     }
-    threaded_rt.shutdown_background();
-    let result = Arc::try_unwrap(live_chats).unwrap().into_inner();
+    handle.join().unwrap();
+
     Ok(result)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     print!("Live streaming id: ");
     io::stdout().flush().unwrap();
     let mut video_id = String::new();
@@ -171,7 +155,7 @@ async fn main() {
     video_id = video_id.trim_end().to_owned();
     println!("Set target: {}", video_id);
 
-    let live_chats = fetch_all_live_chats(video_id.as_str()).await.unwrap();
+    let live_chats = fetch_all_live_chats(video_id.as_str()).unwrap();
     println!(
         "Fetched all live chats successfully!: {} live chats",
         live_chats.len()
